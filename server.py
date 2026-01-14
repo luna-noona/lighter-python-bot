@@ -1,13 +1,14 @@
 import os
 import time
 import inspect
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Tuple, Optional
 
 import lighter
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI()
+
 
 # -----------------------------
 # helpers
@@ -90,7 +91,7 @@ class OrderReq(BaseModel):
     # live=true  => send (real)
     live: bool = False
 
-    # For your SDK this seems required (you discovered order_type=1 fixes the int/float error)
+    # Your SDK needed this to avoid the int/float error
     order_type: int = 1
 
 
@@ -160,7 +161,7 @@ def _market_index_for(market: str) -> int:
 # -----------------------------
 def _base_amount_int(size: float) -> int:
     """
-    Your SignerClient signature wants base_amount as int.
+    Your SignerClient wants base_amount as int.
     Default multiplier 1e8; override via BASE_AMOUNT_MULT if needed.
     """
     mult = int(os.getenv("BASE_AMOUNT_MULT", "100000000"))  # 1e8 default
@@ -182,28 +183,38 @@ async def _call_next_nonce(tx_api: Any, account_index: int, api_key_index: int) 
     raise HTTPException(status_code=500, detail="Could not find TransactionApi next_nonce method")
 
 
-def _extract_tx_type_info(signed_out: Any) -> Tuple[int, str]:
+def _extract_tx_type_info(sign_out: Any) -> Tuple[int, str]:
     """
-    Your SDK’s send_tx expects (tx_type: int, tx_info: str).
+    Your lighter-sdk appears to return:
+      success: (tx_type, tx_info, <something>, None)
+      error:   (None, None, None, "error")
 
-    We accept:
-    - (tx_type, tx_info)
-    - {"tx_type": ..., "tx_info": ...}
-    - object with .tx_type / .tx_info
+    Also supports a 2-tuple (tx_type, tx_info).
     """
-    if isinstance(signed_out, (list, tuple)) and len(signed_out) == 2:
-        tx_type, tx_info = signed_out
+    # (tx_type, tx_info)
+    if isinstance(sign_out, (list, tuple)) and len(sign_out) == 2:
+        return int(sign_out[0]), str(sign_out[1])
+
+    # (tx_type, tx_info, something, err)
+    if isinstance(sign_out, (list, tuple)) and len(sign_out) == 4:
+        tx_type, tx_info, _extra, err = sign_out
+        if err is not None and str(err).strip():
+            raise HTTPException(status_code=500, detail=f"sign_create_order failed: {err}")
+        if tx_type is None or tx_info is None:
+            raise HTTPException(status_code=500, detail="sign_create_order returned empty tx_type/tx_info")
         return int(tx_type), str(tx_info)
 
-    if isinstance(signed_out, dict) and "tx_type" in signed_out and "tx_info" in signed_out:
-        return int(signed_out["tx_type"]), str(signed_out["tx_info"])
+    # dict
+    if isinstance(sign_out, dict) and "tx_type" in sign_out and "tx_info" in sign_out:
+        return int(sign_out["tx_type"]), str(sign_out["tx_info"])
 
-    if hasattr(signed_out, "tx_type") and hasattr(signed_out, "tx_info"):
-        return int(getattr(signed_out, "tx_type")), str(getattr(signed_out, "tx_info"))
+    # object
+    if hasattr(sign_out, "tx_type") and hasattr(sign_out, "tx_info"):
+        return int(getattr(sign_out, "tx_type")), str(getattr(sign_out, "tx_info"))
 
     raise HTTPException(
         status_code=500,
-        detail=f"Could not extract (tx_type, tx_info) from sign_create_order output. Got type={type(signed_out)}",
+        detail=f"Could not extract (tx_type, tx_info) from sign_create_order output. Got type={type(sign_out)} value={repr(sign_out)[:300]}",
     )
 
 
@@ -218,13 +229,13 @@ async def _sign_create_order(
     api_key_index: int,
 ) -> Tuple[int, str]:
     """
-    From your observed signature:
+    Matches your observed signature:
       sign_create_order(
         market_index, client_order_index, base_amount, price, is_ask,
         order_type, time_in_force, reduce_only, trigger_price,
         order_expiry, nonce, api_key_index
       )
-    We'll do a market order style: price=0, trigger_price=0, order_expiry=-1, tif=0, reduce_only=0
+    We'll do a market order style: price=0, trigger_price=0, order_expiry=-1
     """
     fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
     if not fn:
@@ -252,20 +263,13 @@ async def _sign_create_order(
     )
 
     out = await _maybe_await(fn(*args))
-
-    # Some versions return (result, err)
-    if isinstance(out, (list, tuple)) and len(out) == 2 and not isinstance(out[0], (int, str)):
-        maybe_res, maybe_err = out
-        if maybe_err is not None:
-            raise HTTPException(status_code=500, detail=f"sign_create_order failed: {maybe_err}")
-        out = maybe_res
-
-    return _extract_tx_type_info(out)
+    tx_type, tx_info = _extract_tx_type_info(out)
+    return tx_type, tx_info
 
 
 async def _send_tx(signer: Any, tx_type: int, tx_info: str) -> Any:
     """
-    Your SDK signature looks like send_tx(tx_type: int, tx_info: str).
+    Your SDK send_tx expects positional (tx_type, tx_info).
     """
     fn = getattr(signer, "send_tx", None) or getattr(signer, "sendTx", None)
     if not fn:
@@ -283,7 +287,7 @@ async def place_order(req: OrderReq):
     api_client = None
 
     try:
-        _need("ETH_PRIVATE_KEY")  # presence check (your SignerClient uses env key material internally)
+        _need("ETH_PRIVATE_KEY")  # presence check (SDK uses it internally)
         account_index = _as_int("LIGHTER_ACCOUNT_INDEX")
         api_key_index = _as_int("LIGHTER_API_KEY_INDEX")
 
@@ -330,7 +334,6 @@ async def place_order(req: OrderReq):
                 "tx_info_len": len(tx_info),
             }
 
-        # LIVE send
         sent = await _send_tx(signer, tx_type, tx_info)
 
         return {

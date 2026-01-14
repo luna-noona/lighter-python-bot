@@ -1,18 +1,15 @@
 import os
 import time
-from typing import Literal, Any
+from typing import Literal
 
 import lighter
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
-# ----------------------------
-# App
-# ----------------------------
 app = FastAPI()
 
 # ----------------------------
-# Auth
+# AUTH
 # ----------------------------
 def _auth(x_bot_token: str | None):
     expected = os.getenv("BOT_TOKEN")
@@ -20,7 +17,7 @@ def _auth(x_bot_token: str | None):
         raise HTTPException(status_code=401, detail="Unauthorised")
 
 # ----------------------------
-# Helpers
+# HELPERS
 # ----------------------------
 def _need(name: str) -> str:
     v = os.getenv(name)
@@ -32,23 +29,28 @@ def _as_int(name: str) -> int:
     try:
         return int(_need(name))
     except Exception:
-        raise HTTPException(status_code=500, detail=f"{name} must be an integer")
+        raise HTTPException(status_code=500, detail=f"{name} must be int")
 
 def _strip_0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
 
 def _normalise_api_key_hex(s: str) -> str:
     h = _strip_0x(s).strip()
-    int(h, 16)  # validate hex
+    int(h, 16)
     if len(h) != 80:
-        raise HTTPException(
-            status_code=500,
-            detail="LIGHTER_API_KEY_PRIVATE_KEY must be 80 hex chars",
-        )
+        raise HTTPException(status_code=500, detail="API key must be 80 hex chars")
     return h
 
 # ----------------------------
-# Lighter clients
+# MARKET MAP (EXPLICIT)
+# ----------------------------
+MARKET_INDEX_MAP = {
+    "BTC-USDC": 1,
+    "ETH-USDC": 2,
+}
+
+# ----------------------------
+# LIGHTER CLIENTS
 # ----------------------------
 def make_signer() -> lighter.SignerClient:
     return lighter.SignerClient(
@@ -69,23 +71,23 @@ def make_api() -> lighter.ApiClient:
     )
 
 # ----------------------------
-# Models
+# MODELS
 # ----------------------------
 class OrderReq(BaseModel):
     market: str
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
-    live: bool = False  # false = sign only, true = broadcast
+    live: bool = False
 
 # ----------------------------
-# Health
+# HEALTH
 # ----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": int(time.time())}
 
 # ----------------------------
-# Order (MARKET ONLY)
+# ORDER — MARKET ONLY
 # ----------------------------
 @app.post("/order")
 async def place_order(
@@ -98,6 +100,14 @@ async def place_order(
     api_client = None
 
     try:
+        if req.market not in MARKET_INDEX_MAP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown market {req.market}",
+            )
+
+        market_index = MARKET_INDEX_MAP[req.market]
+
         signer = make_signer()
         err = signer.check_client()
         if err:
@@ -106,7 +116,6 @@ async def place_order(
         api_client = make_api()
         tx_api = lighter.TransactionApi(api_client)
 
-        # nonce
         nonce_resp = await tx_api.next_nonce(
             account_index=_as_int("LIGHTER_ACCOUNT_INDEX"),
             api_key_index=_as_int("LIGHTER_API_KEY_INDEX"),
@@ -116,9 +125,9 @@ async def place_order(
         side_int = 0 if req.side == "BUY" else 1
         client_order_index = int(time.time() * 1000)
 
-        # 🔑 MARKET ORDER — NO PRICE, NO ETH KEY PASSED
+        # 🔑 CORRECT SDK CALL (NO market STRING)
         signed_tx = signer.sign_create_order(
-            market=req.market,
+            market_index=market_index,
             side=side_int,
             base_amount=req.size,
             nonce=nonce,
@@ -131,19 +140,20 @@ async def place_order(
                 "live": False,
                 "message": "Signed OK (market order, not sent)",
                 "market": req.market,
+                "market_index": market_index,
                 "side": req.side,
                 "size": req.size,
                 "nonce": nonce,
                 "client_order_index": client_order_index,
             }
 
-        # Broadcast
         send_resp = await tx_api.send_tx(signed_tx)
 
         return {
             "success": True,
             "live": True,
             "market": req.market,
+            "market_index": market_index,
             "side": req.side,
             "size": req.size,
             "nonce": nonce,

@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-lighter-sdk
+lighter-sdk==1.0.2
 eth-account

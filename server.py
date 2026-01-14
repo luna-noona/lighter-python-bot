@@ -1,7 +1,8 @@
 import os
 import time
 import inspect
-from typing import Any, Dict, Literal, Optional
+from decimal import Decimal
+from typing import Any, Dict, Literal
 
 import lighter
 from fastapi import FastAPI, HTTPException
@@ -31,7 +32,7 @@ def _strip_0x(s: str) -> str:
 
 def _normalise_api_key_hex(s: str) -> str:
     """
-    Lighter python SignerClient expects API private key as:
+    Lighter SignerClient (python lighter-sdk) expects API private key as:
       40 bytes = 80 hex chars
     """
     h = _strip_0x(s).strip()
@@ -46,6 +47,56 @@ def _normalise_api_key_hex(s: str) -> str:
             detail=f"LIGHTER_API_KEY_PRIVATE_KEY must be 80 hex chars (40 bytes). Got {len(h)}",
         )
     return h
+
+
+def _parse_map(env_name: str) -> Dict[str, str]:
+    """
+    Parses env like: "BTC-USDC=1,ETH-USDC=2"
+    """
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return {}
+    out: Dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise HTTPException(status_code=500, detail=f"{env_name} has invalid entry: {part}")
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _market_index(market: str) -> int:
+    m = _parse_map("MARKET_INDEX_MAP")
+    if market not in m:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not resolve market_index for {market}. Set MARKET_INDEX_MAP like: BTC-USDC=1,ETH-USDC=2",
+        )
+    return int(m[market])
+
+
+def _amount_scale(market: str) -> int:
+    m = _parse_map("AMOUNT_SCALE_MAP")
+    if market not in m:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing amount scale for {market}. Set AMOUNT_SCALE_MAP like: BTC-USDC=100000000",
+        )
+    return int(m[market])
+
+
+def _to_base_amount_int(market: str, size: float) -> int:
+    """
+    Convert human size (float) -> integer base_amount expected by lighter-sdk.
+    Uses AMOUNT_SCALE_MAP per market (e.g. BTC-USDC=100000000).
+    """
+    scale = _amount_scale(market)
+    # use Decimal to avoid float rounding weirdness
+    amt = (Decimal(str(size)) * Decimal(scale)).to_integral_value()
+    return int(amt)
 
 
 async def _maybe_await(x):
@@ -69,25 +120,12 @@ def make_signer_client() -> lighter.SignerClient:
     )
 
 
-def make_api_client() -> lighter.ApiClient:
-    base_url = os.getenv("BASE_URL", "https://mainnet.zklighter.elliot.ai")
-    return lighter.ApiClient(configuration=lighter.Configuration(host=base_url))
-
-
 # ---------- request models ----------
 class OrderReq(BaseModel):
     market: str = Field(..., description='e.g. "BTC-USDC"')
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
-
-    # SAFETY: live=false = sign only, live=true = actually send
-    live: bool = False
-
-    # Optional advanced knobs (leave alone for now)
-    order_type: int = 0          # 0=LIMIT, 1=MARKET (depends on Lighter config; keep 0 for now)
-    time_in_force: int = 0       # depends on SDK; keep 0 for now
-    reduce_only: bool = False
-    price: Optional[float] = None  # if None, we’ll pass 0
+    live: bool = False  # live=false => sign only; live=true => send tx
 
 
 # ---------- endpoints ----------
@@ -101,156 +139,22 @@ def debug_env():
     base_url = os.getenv("BASE_URL", "https://mainnet.zklighter.elliot.ai")
     api_key_raw = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY", "")
     api_key_no0x = _strip_0x(api_key_raw).strip()
-
     return {
         "BASE_URL": base_url,
         "LIGHTER_ACCOUNT_INDEX": os.getenv("LIGHTER_ACCOUNT_INDEX"),
         "LIGHTER_API_KEY_INDEX": os.getenv("LIGHTER_API_KEY_INDEX"),
+        "LIGHTER_API_KEY_PRIVATE_KEY_len_raw": len(api_key_raw),
         "LIGHTER_API_KEY_PRIVATE_KEY_len_no0x": len(api_key_no0x),
-        "ETH_PRIVATE_KEY_present": bool(os.getenv("ETH_PRIVATE_KEY")),
-        "MARKET_INDEX_MAP_present": bool(os.getenv("MARKET_INDEX_MAP")),
+        "MARKET_INDEX_MAP": bool(os.getenv("MARKET_INDEX_MAP")),
+        "AMOUNT_SCALE_MAP": bool(os.getenv("AMOUNT_SCALE_MAP")),
     }
 
 
-# ---------- market index resolution ----------
-async def _get_market_index(order_api: Any, market_symbol: str) -> int:
-    """
-    Resolve market_index for a symbol like BTC-USDC.
-
-    Priority:
-    1) MARKET_INDEX_MAP env var: e.g. "BTC-USDC=1,ETH-USDC=2"
-    2) Try to fetch from OrderApi if it exposes a markets/list method
-    """
-    # 1) env override (fastest)
-    mapping = os.getenv("MARKET_INDEX_MAP", "").strip()
-    if mapping:
-        pairs = [p.strip() for p in mapping.split(",") if p.strip()]
-        for p in pairs:
-            if "=" in p:
-                k, v = p.split("=", 1)
-                if k.strip().upper() == market_symbol.upper():
-                    return int(v.strip())
-
-    # 2) try common SDK methods
-    # We don't know exact naming, so attempt a few.
-    for name in ["get_markets", "getMarkets", "markets", "list_markets", "listMarkets"]:
-        fn = getattr(order_api, name, None)
-        if fn:
-            res = await _maybe_await(fn())
-            # res may be list of objects/dicts. Try to find symbol field.
-            if isinstance(res, dict) and "markets" in res:
-                res = res["markets"]
-
-            if isinstance(res, list):
-                for m in res:
-                    # object style
-                    sym = getattr(m, "symbol", None) or getattr(m, "ticker", None) or getattr(m, "name", None)
-                    idx = getattr(m, "index", None) or getattr(m, "market_index", None)
-                    # dict style
-                    if isinstance(m, dict):
-                        sym = m.get("symbol") or m.get("ticker") or m.get("name")
-                        idx = m.get("index") or m.get("market_index")
-
-                    if sym and str(sym).upper() == market_symbol.upper():
-                        if idx is None:
-                            raise HTTPException(status_code=500, detail=f"Found market {market_symbol} but no index in response")
-                        return int(idx)
-
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            f"Could not resolve market_index for {market_symbol}. "
-            f"Set MARKET_INDEX_MAP env var like: BTC-USDC=1,ETH-USDC=2"
-        ),
-    )
-
-
-# ---------- nonce / sign / send (SDK version tolerant) ----------
-async def _call_next_nonce(tx_api: Any, account_index: int, api_key_index: int) -> int:
-    for name in ["next_nonce", "nextNonce"]:
-        fn = getattr(tx_api, name, None)
-        if fn:
-            res = await _maybe_await(fn(account_index=account_index, api_key_index=api_key_index))
-            if hasattr(res, "nonce"):
-                return int(res.nonce)
-            if isinstance(res, dict) and "nonce" in res:
-                return int(res["nonce"])
-    raise HTTPException(status_code=500, detail="Could not find TransactionApi next_nonce method")
-
-
-async def _sign_create_order_positional(
-    signer: Any,
-    market_index: int,
-    client_order_index: int,
-    base_amount: float,
-    price: float,
-    is_ask: bool,
-    order_type: int,
-    time_in_force: int,
-    reduce_only: bool,
-    trigger_price: float,
-    order_expiry: int,
-    nonce: int,
-    api_key_index: int,
-):
-    """
-    Uses the exact positional signature you saw:
-
-    sign_create_order(
-      market_index, client_order_index, base_amount, price,
-      is_ask, order_type, time_in_force, reduce_only,
-      trigger_price, order_expiry=-1, nonce=-1, api_key_index=255
-    )
-    """
-    fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
-    if not fn:
-        raise HTTPException(status_code=500, detail="SignerClient does not expose sign_create_order")
-
-    # IMPORTANT: positional args to match your SDK
-    out = await _maybe_await(
-        fn(
-            market_index,
-            client_order_index,
-            base_amount,
-            price,
-            is_ask,
-            order_type,
-            time_in_force,
-            reduce_only,
-            trigger_price,
-            order_expiry,
-            nonce,
-            api_key_index,
-        )
-    )
-
-    # Some SDKs return (signed, err)
-    if isinstance(out, (list, tuple)) and len(out) == 2:
-        signed, err = out
-        if err is not None:
-            raise HTTPException(status_code=500, detail=f"sign_create_order failed: {err}")
-        return signed
-    return out
-
-
-async def _send_tx(tx_api: Any, tx: Any) -> Any:
-    for name in ["send_tx", "sendTx"]:
-        fn = getattr(tx_api, name, None)
-        if fn:
-            return await _maybe_await(fn(tx=tx))
-    raise HTTPException(status_code=500, detail="Could not find TransactionApi send_tx method")
-
-
-# ---------- main order endpoint ----------
 @app.post("/order")
 async def place_order(req: OrderReq):
     signer = None
-    api_client = None
 
     try:
-        # required
-        _ = _need("ETH_PRIVATE_KEY")  # presence check only (your SignerClient might not need it, but keep as guard)
-        account_index = _as_int("LIGHTER_ACCOUNT_INDEX")
         api_key_index = _as_int("LIGHTER_API_KEY_INDEX")
 
         signer = make_signer_client()
@@ -258,38 +162,36 @@ async def place_order(req: OrderReq):
         if err is not None:
             raise HTTPException(status_code=500, detail=f"check_client failed: {err}")
 
-        api_client = make_api_client()
-        tx_api = lighter.TransactionApi(api_client)
-        order_api = lighter.OrderApi(api_client)
+        market_index = _market_index(req.market)
 
-        nonce = await _call_next_nonce(tx_api, account_index, api_key_index)
-
-        market_index = await _get_market_index(order_api, req.market)
-
-        # BUY => not ask. SELL => ask.
+        # BUY => is_ask=False, SELL => is_ask=True
         is_ask = True if req.side == "SELL" else False
 
+        base_amount = _to_base_amount_int(req.market, req.size)
+
+        # For market orders in this SDK, set:
+        # order_type = 1 (market) as you’ve been using
+        order_type = 1
+
+        # Common default time_in_force for market orders:
+        # 0 usually = IOC in many SDKs; if Lighter differs, the error will tell us.
+        time_in_force = 0
+
         client_order_index = int(time.time() * 1000)
-        price = float(req.price) if req.price is not None else 0.0
 
-        # trigger_price: for plain market/limit orders, 0.0 is fine
-        trigger_price = 0.0
-        order_expiry = -1
-
-        signed_tx = await _sign_create_order_positional(
-            signer=signer,
-            market_index=market_index,
-            client_order_index=client_order_index,
-            base_amount=float(req.size),
-            price=price,
-            is_ask=is_ask,
-            order_type=int(req.order_type),
-            time_in_force=int(req.time_in_force),
-            reduce_only=bool(req.reduce_only),
-            trigger_price=trigger_price,
-            order_expiry=order_expiry,
-            nonce=int(nonce),
-            api_key_index=int(api_key_index),
+        # price/is_ask/order_type/time_in_force are required by your SDK signature
+        # price for market order -> 0
+        signed = await _maybe_await(
+            signer.sign_create_order(
+                market_index=market_index,
+                client_order_index=client_order_index,
+                base_amount=base_amount,
+                price=0,
+                is_ask=is_ask,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                api_key_index=api_key_index,
+            )
         )
 
         if not req.live:
@@ -302,19 +204,28 @@ async def place_order(req: OrderReq):
                 "side": req.side,
                 "is_ask": is_ask,
                 "size": req.size,
-                "price": price,
-                "nonce": nonce,
+                "base_amount_int": base_amount,
                 "client_order_index": client_order_index,
             }
 
-        sent = await _send_tx(tx_api, signed_tx)
+        # LIVE send: your SDK often includes a method on signer for sending;
+        # if not, we’ll add TransactionApi in the next step.
+        send_fn = getattr(signer, "send_tx", None) or getattr(signer, "sendTx", None)
+        if not send_fn:
+            raise HTTPException(
+                status_code=500,
+                detail="This lighter-sdk build does not expose send_tx on SignerClient. Tell me your /order sign-only response and I’ll wire TransactionApi.send_tx correctly.",
+            )
+
+        sent = await _maybe_await(send_fn(tx=signed))
 
         return {
             "success": True,
             "live": True,
             "market": req.market,
             "market_index": market_index,
-            "nonce": nonce,
+            "side": req.side,
+            "base_amount_int": base_amount,
             "client_order_index": client_order_index,
             "response": sent,
         }
@@ -327,10 +238,5 @@ async def place_order(req: OrderReq):
         try:
             if signer is not None:
                 await signer.close()
-        except Exception:
-            pass
-        try:
-            if api_client is not None:
-                await api_client.close()
         except Exception:
             pass

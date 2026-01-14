@@ -35,7 +35,6 @@ def _normalise_api_key_hex(s: str) -> str:
     """
     Lighter SignerClient (python lighter-sdk) expects API private key as:
       40 bytes = 80 hex chars
-    (Some UIs show 32 bytes/64 hex; YOUR python SDK build expects 80.)
     """
     h = _strip_0x(s).strip()
     try:
@@ -57,27 +56,68 @@ async def _maybe_await(x):
     return x
 
 
-def _parse_market_index_map() -> Dict[str, int]:
+def _parse_kv_map(env_name: str) -> Dict[str, str]:
     """
-    MARKET_INDEX_MAP format:
-      BTC-USDC=1,ETH-USDC=2
+    Generic "A=B,C=D" parser
     """
-    raw = os.getenv("MARKET_INDEX_MAP", "").strip()
-    mapping: Dict[str, int] = {}
+    raw = os.getenv(env_name, "").strip()
+    out: Dict[str, str] = {}
     if not raw:
-        return mapping
-
+        return out
     for part in raw.split(","):
         part = part.strip()
         if not part or "=" not in part:
             continue
         k, v = part.split("=", 1)
-        mapping[k.strip()] = int(v.strip())
-    return mapping
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_market_index_map() -> Dict[str, int]:
+    """
+    MARKET_INDEX_MAP format:
+      BTC-USDC=1,ETH-USDC=2
+    """
+    m = _parse_kv_map("MARKET_INDEX_MAP")
+    out: Dict[str, int] = {}
+    for k, v in m.items():
+        out[k] = int(v)
+    return out
+
+
+def _parse_base_decimals_map() -> Dict[str, int]:
+    """
+    BASE_DECIMALS_MAP format:
+      BTC-USDC=8,ETH-USDC=18
+
+    Defaults:
+      BTC-USDC=8
+      ETH-USDC=18
+    """
+    out = {"BTC-USDC": 8, "ETH-USDC": 18}
+    m = _parse_kv_map("BASE_DECIMALS_MAP")
+    for k, v in m.items():
+        out[k] = int(v)
+    return out
 
 
 def _resolve_market_index(market: str) -> Optional[int]:
     return _parse_market_index_map().get(market)
+
+
+def _size_to_base_amount_int(market: str, size: float) -> int:
+    dec = _parse_base_decimals_map().get(market)
+    if dec is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f'No base decimals known for "{market}". Set BASE_DECIMALS_MAP like "BTC-USDC=8,ETH-USDC=18".',
+        )
+
+    # convert size -> integer units
+    base_amount = int(round(float(size) * (10 ** dec)))
+    if base_amount <= 0:
+        raise HTTPException(status_code=500, detail="size too small after conversion (base_amount <= 0)")
+    return base_amount
 
 
 # -----------------------------
@@ -111,12 +151,11 @@ class OrderReq(BaseModel):
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
 
-    # Your current lighter-sdk build signs a limit-style order and requires a price.
-    price: Optional[float] = None
+    # Your current lighter-sdk signing call requires a price (limit-style).
+    # Provide an integer price (as your SDK expects).
+    price: int = Field(..., gt=0)
 
-    # live=false => signs only (safe, no trade)
-    # live=true  => attempts broadcast (live trading)
-    live: bool = False
+    live: bool = False  # live=false => sign only; live=true => attempt broadcast
 
 
 # -----------------------------
@@ -140,44 +179,8 @@ def debug_env():
         "LIGHTER_API_KEY_PRIVATE_KEY_len_raw": len(api_key_raw),
         "LIGHTER_API_KEY_PRIVATE_KEY_len_no0x": len(api_key_no0x),
         "ETH_PRIVATE_KEY_present": bool(os.getenv("ETH_PRIVATE_KEY")),
-        "MARKET_INDEX_MAP_present": bool(os.getenv("MARKET_INDEX_MAP")),
-        "MARKET_INDEX_MAP_preview": os.getenv("MARKET_INDEX_MAP", "")[:120],
-    }
-
-
-@app.get("/sdk-info")
-def sdk_info():
-    """
-    Shows what your deployed lighter-sdk build exposes (so we can wire broadcast precisely).
-    """
-    import inspect as _inspect
-
-    sc = lighter.SignerClient
-    tx = lighter.TransactionApi
-
-    def _sig(cls, name: str):
-        fn = getattr(cls, name, None)
-        if not fn:
-            return None
-        try:
-            return str(_inspect.signature(fn))
-        except Exception:
-            return "signature unavailable"
-
-    signer_methods = sorted({m for m in dir(sc) if any(k in m.lower() for k in ["sign", "order", "tx", "send", "broadcast"])})
-    tx_methods = sorted({m for m in dir(tx) if any(k in m.lower() for k in ["nonce", "tx", "send", "broadcast"])})
-
-    return {
-        "lighter_version": getattr(lighter, "__version__", "unknown"),
-        "signerclient_methods_filtered": signer_methods,
-        "transactionapi_methods_filtered": tx_methods,
-        "signatures": {
-            "SignerClient.sign_create_order": _sig(sc, "sign_create_order"),
-            "SignerClient.send_tx": _sig(sc, "send_tx"),
-            "TransactionApi.next_nonce": _sig(tx, "next_nonce"),
-            "TransactionApi.send_tx": _sig(tx, "send_tx"),
-            "TransactionApi.sendTx": _sig(tx, "sendTx"),
-        },
+        "MARKET_INDEX_MAP": os.getenv("MARKET_INDEX_MAP", ""),
+        "BASE_DECIMALS_MAP": os.getenv("BASE_DECIMALS_MAP", ""),
     }
 
 
@@ -205,31 +208,31 @@ async def _sign_create_order(signer: Any, req: OrderReq, nonce: int, client_orde
     if market_index is None:
         raise HTTPException(
             status_code=500,
-            detail=f'Unknown market "{req.market}". Set MARKET_INDEX_MAP like "BTC-USDC=1,ETH-USDC=2".',
+            detail=f'Could not resolve market_index for {req.market}. Set MARKET_INDEX_MAP env var like "BTC-USDC=1,ETH-USDC=2".',
         )
 
-    if req.price is None:
-        raise HTTPException(status_code=500, detail="price is required for this SDK build")
+    # Convert float size to integer base amount (e.g. BTC satoshis)
+    base_amount_int = _size_to_base_amount_int(req.market, req.size)
 
-    # Lighter is_ask convention: SELL=True, BUY=False
+    # SDK uses is_ask: SELL=True, BUY=False
     is_ask = (req.side == "SELL")
 
     sig = inspect.signature(fn)
     accepted = set(sig.parameters.keys())
 
-    # This matches the signature you’re seeing in your logs.
+    # Build args according to your printed signature:
     candidate: Dict[str, Any] = {
         "market_index": int(market_index),
         "client_order_index": int(client_order_index),
         "index": 0,
-        "base_amount": float(req.size),
+        "base_amount": int(base_amount_int),
         "price": int(req.price),
         "is_ask": bool(is_ask),
-        "order_type": 1,       # limit
-        "time_in_force": 0,    # GTC
+        "order_type": 1,        # limit
+        "time_in_force": 0,     # GTC
         "reduce_only": False,
         "trigger_price": 0,
-        "order_expiry": 0,
+        "order_expiry": 0,      # 0 means no expiry in many builds
         "nonce": int(nonce),
         "api_key_index": _as_int("LIGHTER_API_KEY_INDEX"),
     }
@@ -241,7 +244,7 @@ async def _sign_create_order(signer: Any, req: OrderReq, nonce: int, client_orde
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"sign_create_order failed. signature={sig}. accepted={sorted(list(accepted))}. error={e}",
+            detail=f"sign_create_order failed. signature={sig}. error={e}",
         )
 
 
@@ -249,49 +252,49 @@ def _extract_tx_payload(signed_out: Any) -> Dict[str, Any]:
     """
     Try to extract {tx_type, tx_info} for broadcast. SDK variants differ.
     """
+    # Common: (tx_type, tx_info, err?) tuples
     if isinstance(signed_out, (list, tuple)) and len(signed_out) >= 2:
         return {"tx_type": signed_out[0], "tx_info": signed_out[1]}
 
+    # Dict output
     if isinstance(signed_out, dict):
         if "tx_type" in signed_out and "tx_info" in signed_out:
             return {"tx_type": signed_out["tx_type"], "tx_info": signed_out["tx_info"]}
-        return signed_out
 
-    for a in ["tx_type", "txType"]:
-        if hasattr(signed_out, a):
-            tx_type = getattr(signed_out, a)
-            tx_info = getattr(signed_out, "tx_info", None) or getattr(signed_out, "txInfo", None)
-            return {"tx_type": tx_type, "tx_info": tx_info}
+    # Object output
+    tx_type = getattr(signed_out, "tx_type", None) or getattr(signed_out, "txType", None)
+    tx_info = getattr(signed_out, "tx_info", None) or getattr(signed_out, "txInfo", None)
+    if tx_type is not None and tx_info is not None:
+        return {"tx_type": tx_type, "tx_info": tx_info}
 
     raise HTTPException(
         status_code=500,
-        detail="Could not extract (tx_type, tx_info) from sign_create_order output. Run /sdk-info and paste it.",
+        detail="Could not extract (tx_type, tx_info) from sign_create_order output.",
     )
 
 
 async def _broadcast_best_effort(signer: Any, tx_api: Any, signed_out: Any) -> Any:
     payload = _extract_tx_payload(signed_out)
 
-    # 1) TransactionApi send
+    # Try TransactionApi broadcast methods first
     for name in ["send_tx", "sendTx"]:
         fn = getattr(tx_api, name, None)
         if not fn:
             continue
 
-        # try kwargs
+        # Try kwargs first
         try:
             return await _maybe_await(fn(**payload))
         except TypeError:
             pass
 
-        # try positional: (tx_type, tx_info)
-        if "tx_type" in payload and "tx_info" in payload:
-            try:
-                return await _maybe_await(fn(payload["tx_type"], payload["tx_info"]))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"{name} positional failed: {e}")
+        # Try positional (tx_type, tx_info)
+        try:
+            return await _maybe_await(fn(payload["tx_type"], payload["tx_info"]))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"{name} positional failed: {e}")
 
-    # 2) SignerClient send
+    # Then try SignerClient broadcast methods if present
     for name in ["send_tx", "sendTx", "send"]:
         fn = getattr(signer, name, None)
         if not fn:
@@ -302,15 +305,14 @@ async def _broadcast_best_effort(signer: Any, tx_api: Any, signed_out: Any) -> A
         except TypeError:
             pass
 
-        if "tx_type" in payload and "tx_info" in payload:
-            try:
-                return await _maybe_await(fn(payload["tx_type"], payload["tx_info"]))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"{name} positional failed: {e}")
+        try:
+            return await _maybe_await(fn(payload["tx_type"], payload["tx_info"]))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"{name} positional failed: {e}")
 
     raise HTTPException(
         status_code=500,
-        detail="No working broadcast method found in this lighter-sdk build. Run /sdk-info and paste output.",
+        detail="No working broadcast method found in this lighter-sdk build.",
     )
 
 
@@ -323,7 +325,7 @@ async def place_order(req: OrderReq):
     api_client = None
 
     try:
-        # keep present; needed for real trading later even if not passed into sign_create_order
+        # Keep required for later (even if not used by sign_create_order in this build)
         _need("ETH_PRIVATE_KEY")
 
         signer = make_signer_client()
@@ -339,6 +341,7 @@ async def place_order(req: OrderReq):
 
         signed_out = await _sign_create_order(signer, req, nonce, client_order_index)
 
+        # Sign-only mode
         if not req.live:
             return {
                 "success": True,
@@ -348,11 +351,13 @@ async def place_order(req: OrderReq):
                 "market_index": _resolve_market_index(req.market),
                 "side": req.side,
                 "size": req.size,
+                "base_amount": _size_to_base_amount_int(req.market, req.size),
                 "price": req.price,
                 "nonce": nonce,
                 "client_order_index": client_order_index,
             }
 
+        # LIVE send attempt
         sent = await _broadcast_best_effort(signer, tx_api, signed_out)
 
         return {
@@ -362,6 +367,7 @@ async def place_order(req: OrderReq):
             "market_index": _resolve_market_index(req.market),
             "side": req.side,
             "size": req.size,
+            "base_amount": _size_to_base_amount_int(req.market, req.size),
             "price": req.price,
             "nonce": nonce,
             "client_order_index": client_order_index,

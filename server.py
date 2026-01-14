@@ -1,7 +1,7 @@
 import os
 import time
-import asyncio
-from typing import Optional, Literal, Any, Dict
+import inspect
+from typing import Any, Dict, Literal
 
 import lighter
 from fastapi import FastAPI, HTTPException
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 app = FastAPI()
 
 
+# ---------- helpers ----------
 def _need(name: str) -> str:
     v = os.getenv(name)
     if not v:
@@ -30,18 +31,21 @@ def _strip_0x(s: str) -> str:
 
 def _normalise_api_key_hex(s: str) -> str:
     """
-    Lighter python SignerClient expects API private key as *40 bytes* (80 hex chars).
-    Some people paste with 0x prefix; remove it.
-    Keep it as 80 hex chars (DO NOT trim to 64).
+    Lighter SignerClient (python lighter-sdk) expects API private key as:
+      40 bytes = 80 hex chars
+    Render env var can include optional 0x prefix; we remove it.
     """
     h = _strip_0x(s).strip()
-    # sanity: hex only
     try:
         int(h, 16)
     except Exception:
         raise HTTPException(status_code=500, detail="LIGHTER_API_KEY_PRIVATE_KEY is not valid hex")
+
     if len(h) != 80:
-        raise HTTPException(status_code=500, detail=f"LIGHTER_API_KEY_PRIVATE_KEY must be 80 hex chars (40 bytes). Got {len(h)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"LIGHTER_API_KEY_PRIVATE_KEY must be 80 hex chars (40 bytes). Got {len(h)}",
+        )
     return h
 
 
@@ -66,17 +70,22 @@ def make_api_client() -> lighter.ApiClient:
     return lighter.ApiClient(configuration=lighter.Configuration(host=base_url))
 
 
+async def _maybe_await(x):
+    """Await if x is awaitable, else return x."""
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+# ---------- request models ----------
 class OrderReq(BaseModel):
     market: str = Field(..., description='e.g. "BTC-USDC"')
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
-
-    # SAFETY SWITCH:
-    # live=false => just builds/signs and returns debug (no send)
-    # live=true  => actually sends tx
-    live: bool = False
+    live: bool = False  # live=false => sign only; live=true => send tx
 
 
+# ---------- endpoints ----------
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": int(time.time())}
@@ -88,7 +97,7 @@ def debug_env():
     api_key_raw = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY", "")
     api_key_no0x = _strip_0x(api_key_raw).strip()
 
-    out: Dict[str, Any] = {
+    return {
         "BASE_URL": base_url,
         "LIGHTER_ACCOUNT_INDEX": os.getenv("LIGHTER_ACCOUNT_INDEX"),
         "LIGHTER_API_KEY_INDEX": os.getenv("LIGHTER_API_KEY_INDEX"),
@@ -96,27 +105,22 @@ def debug_env():
         "LIGHTER_API_KEY_PRIVATE_KEY_len_no0x": len(api_key_no0x),
         "ETH_PRIVATE_KEY_present": bool(os.getenv("ETH_PRIVATE_KEY")),
     }
-    return out
 
 
+# ---------- sdk adapters (handle version differences) ----------
 async def _call_next_nonce(tx_api: Any, account_index: int, api_key_index: int) -> int:
-    """
-    Different builds name this slightly differently. Try a few.
-    """
     for name in ["next_nonce", "nextNonce"]:
         fn = getattr(tx_api, name, None)
         if fn:
-            res = await fn(account_index=account_index, api_key_index=api_key_index)
-            # res might be an object with .nonce or dict-like
+            res = await _maybe_await(fn(account_index=account_index, api_key_index=api_key_index))
             if hasattr(res, "nonce"):
                 return int(res.nonce)
             if isinstance(res, dict) and "nonce" in res:
                 return int(res["nonce"])
-            # fallthrough if unexpected
-    raise HTTPException(status_code=500, detail="Could not find a working TransactionApi next_nonce method")
+    raise HTTPException(status_code=500, detail="Could not find TransactionApi next_nonce method")
 
 
-async def _call_sign_create_order(
+async def _sign_create_order(
     signer: Any,
     eth_private_key: str,
     market: str,
@@ -124,65 +128,118 @@ async def _call_sign_create_order(
     base_amount: float,
     nonce: int,
     client_order_index: int,
-) -> Any:
+):
     """
-    Try common method names used by the SDK.
+    Handles multiple lighter-sdk variants for sign_create_order:
+      - sync or async
+      - may accept ETH key as kwarg, positional, or not at all
+      - market/size/base_amount naming differences
     """
-    for name in ["sign_create_order", "signCreateOrder", "sign_create_order_tx", "signCreateOrderTx"]:
-        fn = getattr(signer, name, None)
-        if fn:
-            # Some versions return (signed, err), some just signed
-            out = await fn(
-                eth_private_key=eth_private_key,
-                market=market,
-                side=side,
-                base_amount=base_amount,
-                nonce=nonce,
-                client_order_index=client_order_index,
-            )
+    fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
+    if not fn:
+        raise HTTPException(status_code=500, detail="SignerClient does not expose sign_create_order")
+
+    sig = inspect.signature(fn)
+
+    field_variants = [
+        {"market": market, "side": side, "base_amount": base_amount, "nonce": nonce, "client_order_index": client_order_index},
+        {"ticker": market, "side": side, "base_amount": base_amount, "nonce": nonce, "client_order_index": client_order_index},
+        {"market": market, "side": side, "size": base_amount, "nonce": nonce, "client_order_index": client_order_index},
+        {"ticker": market, "side": side, "size": base_amount, "nonce": nonce, "client_order_index": client_order_index},
+    ]
+
+    # Try order: no key -> positional key -> kw key
+    key_kw_variants = [
+        None,  # no key
+        {"eth_private_key": eth_private_key},
+        {"private_key": eth_private_key},
+        {"key": eth_private_key},
+        {"signer_private_key": eth_private_key},
+    ]
+
+    last_err = None
+
+    for fields in field_variants:
+        # 1) Try without key kw
+        try:
+            out = await _maybe_await(fn(**fields))
+            # normalise (signed, err) tuples
+            if isinstance(out, (list, tuple)) and len(out) == 2:
+                signed, err = out
+                if err is not None:
+                    raise Exception(str(err))
+                return signed
             return out
-    raise HTTPException(status_code=500, detail="Could not find a working SignerClient sign_create_order method")
+        except Exception as e:
+            last_err = e
+
+        # 2) Try ETH key as positional first arg (some builds do this)
+        try:
+            out = await _maybe_await(fn(eth_private_key, **fields))
+            if isinstance(out, (list, tuple)) and len(out) == 2:
+                signed, err = out
+                if err is not None:
+                    raise Exception(str(err))
+                return signed
+            return out
+        except Exception as e:
+            last_err = e
+
+        # 3) Try various kwarg names for the key
+        for key_kw in key_kw_variants:
+            if not key_kw:
+                continue
+            try:
+                out = await _maybe_await(fn(**{**fields, **key_kw}))
+                if isinstance(out, (list, tuple)) and len(out) == 2:
+                    signed, err = out
+                    if err is not None:
+                        raise Exception(str(err))
+                    return signed
+                return out
+            except Exception as e:
+                last_err = e
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Failed to call sign_create_order. signature={sig}. last_error={last_err}",
+    )
 
 
-async def _call_send_tx(tx_api: Any, tx: Any) -> Any:
+async def _send_tx(tx_api: Any, tx: Any) -> Any:
     for name in ["send_tx", "sendTx"]:
         fn = getattr(tx_api, name, None)
         if fn:
-            return await fn(tx=tx)
-    raise HTTPException(status_code=500, detail="Could not find a working TransactionApi send_tx method")
+            return await _maybe_await(fn(tx=tx))
+    raise HTTPException(status_code=500, detail="Could not find TransactionApi send_tx method")
 
 
+# ---------- main order endpoint ----------
 @app.post("/order")
 async def place_order(req: OrderReq):
-    """
-    Market order test:
-    - live=false => just initialises + gets nonce + signs (no send)
-    - live=true  => sends to Lighter
-    """
     signer = None
     api_client = None
 
     try:
+        # required for signing/sending
         eth_private_key = _need("ETH_PRIVATE_KEY")
         account_index = _as_int("LIGHTER_ACCOUNT_INDEX")
         api_key_index = _as_int("LIGHTER_API_KEY_INDEX")
 
-        # 1) init signer client
         signer = make_signer_client()
         err = signer.check_client()
         if err is not None:
             raise HTTPException(status_code=500, detail=f"check_client failed: {err}")
 
-        # 2) nonce
         api_client = make_api_client()
         tx_api = lighter.TransactionApi(api_client)
+
         nonce = await _call_next_nonce(tx_api, account_index, api_key_index)
 
-        # 3) sign order
         side = 0 if req.side == "BUY" else 1
         client_order_index = int(time.time() * 1000)
 
-        signed_out = await _call_sign_create_order(
+        signed_tx = await _sign_create_order(
             signer=signer,
             eth_private_key=eth_private_key,
             market=req.market,
@@ -192,14 +249,7 @@ async def place_order(req: OrderReq):
             client_order_index=client_order_index,
         )
 
-        # normalise outputs across SDK versions
-        signed_tx = signed_out
-        sign_err = None
-        if isinstance(signed_out, (list, tuple)) and len(signed_out) == 2:
-            signed_tx, sign_err = signed_out
-        if sign_err is not None:
-            raise HTTPException(status_code=500, detail=f"sign_create_order failed: {sign_err}")
-
+        # sign-only mode
         if not req.live:
             return {
                 "success": True,
@@ -212,8 +262,8 @@ async def place_order(req: OrderReq):
                 "size": req.size,
             }
 
-        # 4) send tx (LIVE)
-        sent = await _call_send_tx(tx_api, signed_tx)
+        # LIVE send
+        sent = await _send_tx(tx_api, signed_tx)
 
         return {
             "success": True,

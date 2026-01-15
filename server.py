@@ -1,7 +1,8 @@
 import os
 import time
+import json
 import inspect
-from typing import Any, Dict, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import lighter
 from fastapi import FastAPI, HTTPException, Header
@@ -118,7 +119,7 @@ class OrderReq(BaseModel):
     market: str
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
-    price: Optional[float] = None
+    price: Optional[float] = None  # required for this SDK build
     live: bool = False
 
 
@@ -169,6 +170,11 @@ async def _sign_create_order_exact(
     is_ask: bool,
     nonce: int,
 ) -> Any:
+    """
+    Matches the signature you previously printed:
+      (market_index, client_order_index, api_key_index, base_amount, price, is_ask,
+       order_type, time_in_force, reduce_only, trigger_price, order_expiry, nonce)
+    """
     fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
     if not fn:
         raise HTTPException(status_code=500, detail="SignerClient does not expose sign_create_order")
@@ -177,7 +183,7 @@ async def _sign_create_order_exact(
     order_type = 0        # LIMIT
     time_in_force = 1     # IOC
     reduce_only = False
-    trigger_price = 0     # IMPORTANT: int, not float
+    trigger_price = 0     # MUST be int (not float)
     order_expiry = -1     # no expiry
 
     args = [
@@ -198,6 +204,7 @@ async def _sign_create_order_exact(
     try:
         out = fn(*args)
         out = await _maybe_await(out)
+        # some builds return (signed, err)
         if isinstance(out, (list, tuple)) and len(out) == 2:
             signed, err = out
             if err is not None:
@@ -210,13 +217,9 @@ async def _sign_create_order_exact(
 
 
 def _deep_find(obj: Any, want_keys: Tuple[str, ...], max_depth: int = 6) -> Optional[Any]:
-    """
-    Recursively searches dicts/objects for the first matching key/attr.
-    """
     if max_depth <= 0 or obj is None:
         return None
 
-    # dict
     if isinstance(obj, dict):
         for k in want_keys:
             if k in obj and obj[k] is not None:
@@ -227,7 +230,6 @@ def _deep_find(obj: Any, want_keys: Tuple[str, ...], max_depth: int = 6) -> Opti
                 return found
         return None
 
-    # list/tuple
     if isinstance(obj, (list, tuple)):
         for v in obj:
             found = _deep_find(v, want_keys, max_depth - 1)
@@ -235,106 +237,73 @@ def _deep_find(obj: Any, want_keys: Tuple[str, ...], max_depth: int = 6) -> Opti
                 return found
         return None
 
-    # object attrs
     for k in want_keys:
         if hasattr(obj, k):
             val = getattr(obj, k)
             if val is not None:
                 return val
 
-    # also scan __dict__
     if hasattr(obj, "__dict__"):
         return _deep_find(obj.__dict__, want_keys, max_depth - 1)
 
     return None
 
 
-def _extract_tx_bits(signed: Any) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Attempts multiple patterns:
-    - tx_type/txType/type
-    - tx_info/txInfo/info
-    - nested structures (dicts/attrs)
-    """
-    tx_type_raw = _deep_find(signed, ("tx_type", "txType", "type", "tx_type_", "tx_type__"))
-    tx_info_raw = _deep_find(signed, ("tx_info", "txInfo", "info", "tx", "payload"))
-
-    tx_type: Optional[int] = None
-    tx_info: Optional[str] = None
-
-    if tx_type_raw is not None:
-        try:
-            tx_type = int(tx_type_raw)
-        except Exception:
-            tx_type = None
-
-    if tx_info_raw is not None:
-        try:
-            tx_info = str(tx_info_raw)
-        except Exception:
-            tx_info = None
-
-    return tx_type, tx_info
+def _to_tx_info_string(tx_info_raw: Any) -> Optional[str]:
+    if tx_info_raw is None:
+        return None
+    if isinstance(tx_info_raw, str):
+        return tx_info_raw
+    # sometimes it’s a dict/object; send_tx wants a string, so JSON it
+    try:
+        if isinstance(tx_info_raw, dict):
+            return json.dumps(tx_info_raw, separators=(",", ":"))
+        if hasattr(tx_info_raw, "__dict__"):
+            return json.dumps(tx_info_raw.__dict__, separators=(",", ":"))
+        return str(tx_info_raw)
+    except Exception:
+        return str(tx_info_raw)
 
 
-def _signed_debug_preview(signed: Any) -> Dict[str, Any]:
-    """
-    Safe preview for debugging shapes (no keys).
-    """
+def _extract_tx_info(signed: Any) -> Optional[str]:
+    raw = _deep_find(signed, ("tx_info", "txInfo", "info", "tx"))
+    return _to_tx_info_string(raw)
+
+
+def _signed_preview(signed: Any) -> Dict[str, Any]:
     if isinstance(signed, dict):
-        return {"kind": "dict", "keys": list(signed.keys())[:50]}
+        return {"kind": "dict", "keys": list(signed.keys())[:60]}
     if isinstance(signed, (list, tuple)):
         return {"kind": type(signed).__name__, "len": len(signed), "head_types": [type(x).__name__ for x in signed[:5]]}
-    return {"kind": type(signed).__name__, "attrs": list(getattr(signed, "__dict__", {}).keys())[:50]}
+    return {"kind": type(signed).__name__, "attrs": list(getattr(signed, "__dict__", {}).keys())[:60]}
 
 
-async def _broadcast_any(tx_api: Any, signed: Any, tx_type: Optional[int], tx_info: Optional[str]) -> Any:
+async def _broadcast_send_tx(tx_api: Any, is_ask: bool, tx_info: str) -> Any:
     """
-    Tries MANY broadcast styles:
-    1) send/broadcast whole signed payload
-    2) send/broadcast tx_type + tx_info (kw/pos/dict)
+    Your SDK is telling us send_tx requires:
+      send_tx(is_ask, tx_info, ...)
+    and it rejects payload=/tx= kwargs.
     """
-    candidates = []
-    for name in ["send_tx", "sendTx", "broadcast_tx", "broadcastTx"]:
-        fn = getattr(tx_api, name, None)
-        if fn:
-            candidates.append((name, fn))
-
-    if not candidates:
-        raise HTTPException(status_code=500, detail="No send/broadcast method found on TransactionApi")
+    fn = getattr(tx_api, "send_tx", None) or getattr(tx_api, "sendTx", None)
+    if not fn:
+        raise HTTPException(status_code=500, detail="TransactionApi does not expose send_tx")
 
     last_err = None
 
-    for name, fn in candidates:
-        # A) whole signed payload
-        for attempt in (
-            lambda: fn(signed),
-            lambda: fn(tx=signed),
-            lambda: fn(payload=signed),
-        ):
-            try:
-                return await _maybe_await(attempt())
-            except Exception as e:
-                last_err = e
+    # Try positional (most likely for your build)
+    try:
+        return await _maybe_await(fn(bool(is_ask), tx_info))
+    except Exception as e:
+        last_err = e
 
-        # B) tx_type + tx_info if available
-        if tx_type is not None and tx_info:
-            for attempt in (
-                lambda: fn(tx_type=tx_type, tx_info=tx_info),
-                lambda: fn(tx_type, tx_info),
-                lambda: fn({"tx_type": tx_type, "tx_info": tx_info}),
-                lambda: fn(tx={"tx_type": tx_type, "tx_info": tx_info}),
-            ):
-                try:
-                    return await _maybe_await(attempt())
-                except Exception as e:
-                    last_err = e
+    # Try keyword form (some builds)
+    try:
+        return await _maybe_await(fn(is_ask=bool(is_ask), tx_info=tx_info))
+    except Exception as e:
+        last_err = e
 
-    sigs = [f"{n}{inspect.signature(f)}" for (n, f) in candidates]
-    raise HTTPException(
-        status_code=500,
-        detail=f"Could not broadcast tx with this lighter-sdk build. methods_tried={sigs}. last_error={last_err}",
-    )
+    sig = str(inspect.signature(fn))
+    raise HTTPException(status_code=500, detail=f"send_tx call failed. signature={sig}. last_error={last_err}")
 
 
 # ---------------------------
@@ -355,7 +324,6 @@ def debug_env():
         "BOT_TOKEN_set": bool(os.getenv("BOT_TOKEN")),
         "MARKET_INDEX_MAP_preview": list(_parse_kv_map("MARKET_INDEX_MAP").items())[:5],
         "BASE_DECIMALS_MAP_preview": list(_parse_kv_map("BASE_DECIMALS_MAP").items())[:5],
-        "AMOUNT_SCALE_MAP_preview": list(_parse_kv_map("AMOUNT_SCALE_MAP").items())[:5],
     }
 
 
@@ -377,7 +345,7 @@ async def place_order(
         base_amount_int = _to_base_amount_int(req.market, req.size)
 
         if req.price is None:
-            raise HTTPException(status_code=400, detail="price is required for this build")
+            raise HTTPException(status_code=400, detail="price is required for this SDK build")
 
         is_ask = True if req.side == "SELL" else False
         client_order_index = int(time.time() * 1000)
@@ -403,8 +371,8 @@ async def place_order(
             nonce=nonce,
         )
 
-        tx_type, tx_info = _extract_tx_bits(signed)
-        preview = _signed_debug_preview(signed)
+        tx_info = _extract_tx_info(signed)
+        preview = _signed_preview(signed)
 
         if not req.live:
             return {
@@ -414,17 +382,24 @@ async def place_order(
                 "market": req.market,
                 "market_index": market_index,
                 "side": req.side,
+                "is_ask": is_ask,
                 "size": req.size,
                 "base_amount": base_amount_int,
                 "price": req.price,
                 "nonce": nonce,
                 "client_order_index": client_order_index,
-                "tx_type": tx_type,
                 "tx_info_present": bool(tx_info),
+                "tx_info_len": len(tx_info) if tx_info else 0,
                 "signed_preview": preview,
             }
 
-        sent = await _broadcast_any(tx_api, signed=signed, tx_type=tx_type, tx_info=tx_info)
+        if not tx_info:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Signed output did not include tx_info, cannot broadcast. signed_preview={preview}",
+            )
+
+        sent = await _broadcast_send_tx(tx_api, is_ask=is_ask, tx_info=tx_info)
 
         return {
             "success": True,
@@ -432,13 +407,14 @@ async def place_order(
             "market": req.market,
             "market_index": market_index,
             "side": req.side,
+            "is_ask": is_ask,
             "size": req.size,
             "base_amount": base_amount_int,
             "price": req.price,
             "nonce": nonce,
             "client_order_index": client_order_index,
-            "tx_type": tx_type,
-            "tx_info_present": bool(tx_info),
+            "tx_info_present": True,
+            "tx_info_len": len(tx_info),
             "signed_preview": preview,
             "response": sent,
         }

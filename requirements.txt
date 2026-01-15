@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 lighter-sdk==1.0.2
 pydantic
+httpx==0.27.0

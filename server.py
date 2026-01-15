@@ -1,16 +1,16 @@
 import os
 import time
-from typing import Any, Dict, Literal, Optional, Tuple
+import inspect
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
-import httpx
-import zklighter
-from fastapi import FastAPI, Header, HTTPException
+import lighter
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-# CORS (Loveable runs in-browser, so allow it)
+# Allow Loveable/browser calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -19,187 +19,293 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
+# -----------------------------
 # Helpers
-# ----------------------------
+# -----------------------------
 def _need(name: str) -> str:
     v = os.getenv(name)
     if not v:
-        raise HTTPException(status_code=500, detail=f"Missing env var: {name}")
+        raise HTTPException(status_code=500, detail=f"Missing {name}")
     return v
 
 
-def _auth(x_bot_token: Optional[str]) -> None:
-    expected = os.getenv("BOT_TOKEN")
-    # If BOT_TOKEN is set, require it.
-    if expected and x_bot_token != expected:
-        raise HTTPException(status_code=401, detail="Unauthorised")
+def _as_int(name: str) -> int:
+    try:
+        return int(_need(name))
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"{name} must be an integer")
 
 
-def _parse_map_env(name: str) -> Dict[str, str]:
+def _strip_0x(s: str) -> str:
+    return s[2:] if s.startswith("0x") else s
+
+
+def _normalise_api_key_hex(s: str) -> str:
     """
-    Parses env like:
-      BTC-USDC=1,ETH-USDC=2
-    into dict.
+    Lighter SignerClient expects API private key as 40 bytes = 80 hex chars.
     """
-    raw = os.getenv(name, "").strip()
+    h = _strip_0x(s).strip()
+    try:
+        int(h, 16)
+    except Exception:
+        raise HTTPException(status_code=500, detail="LIGHTER_API_KEY_PRIVATE_KEY is not valid hex")
+    if len(h) != 80:
+        raise HTTPException(
+            status_code=500,
+            detail=f"LIGHTER_API_KEY_PRIVATE_KEY must be 80 hex chars (40 bytes). Got {len(h)}",
+        )
+    return h
+
+
+def _parse_map(env_name: str) -> Dict[str, str]:
+    """
+    Parse maps like: "BTC-USDC=1,ETH-USDC=2"
+    Returns dict[str,str] with trimmed keys/values.
+    """
+    raw = os.getenv(env_name, "").strip()
     out: Dict[str, str] = {}
     if not raw:
         return out
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
             continue
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
+        k, v = p.split("=", 1)
         out[k.strip()] = v.strip()
     return out
 
 
-def _market_index(market: str) -> int:
-    m = _parse_map_env("MARKET_INDEX_MAP")
-    if market not in m:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not resolve market_index for {market}. Set MARKET_INDEX_MAP env var like BTC-USDC=1,ETH-USDC=2",
-        )
-    try:
-        return int(m[market])
-    except Exception:
-        raise HTTPException(status_code=500, detail=f"MARKET_INDEX_MAP value for {market} must be int")
+def _auth(x_bot_token: Optional[str]) -> None:
+    expected = os.getenv("BOT_TOKEN")
+    # If BOT_TOKEN is not set, don't block (dev mode)
+    if expected and x_bot_token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorised")
 
 
-def _base_decimals(market: str) -> int:
-    m = _parse_map_env("BASE_DECIMALS_MAP")
-    if market not in m:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Missing BASE_DECIMALS_MAP for {market}. Example: BTC-USDC=8,ETH-USDC=18",
-        )
-    try:
-        return int(m[market])
-    except Exception:
-        raise HTTPException(status_code=500, detail=f"BASE_DECIMALS_MAP value for {market} must be int")
+async def _maybe_await(x: Any) -> Any:
+    return await x if inspect.isawaitable(x) else x
 
 
-def _price_decimals(market: str) -> int:
-    # Optional. If not set, default to 2 (matches most examples).
-    m = _parse_map_env("PRICE_DECIMALS_MAP")
-    if market in m:
-        try:
-            return int(m[market])
-        except Exception:
-            raise HTTPException(status_code=500, detail=f"PRICE_DECIMALS_MAP value for {market} must be int")
-    return 2
+def make_signer_client() -> lighter.SignerClient:
+    base_url = os.getenv("BASE_URL", os.getenv("BASE_API_URL", "https://mainnet.zklighter.elliot.ai"))
+    account_index = _as_int("LIGHTER_ACCOUNT_INDEX")
+    api_key_index = _as_int("LIGHTER_API_KEY_INDEX")
+    api_private_key = _normalise_api_key_hex(_need("LIGHTER_API_KEY_PRIVATE_KEY"))
+    api_private_keys = {api_key_index: api_private_key}
+
+    return lighter.SignerClient(
+        url=base_url,
+        account_index=account_index,
+        api_private_keys=api_private_keys,
+    )
 
 
-def _size_to_base_amount(market: str, size_float: float) -> int:
-    # Convert to int in base units using BASE_DECIMALS_MAP
-    dec = _base_decimals(market)
-    scale = 10 ** dec
-    amt = int(round(size_float * scale))
-    if amt <= 0:
-        raise HTTPException(status_code=400, detail="Size too small after decimal conversion")
-    return amt
+def make_api_client() -> lighter.ApiClient:
+    base_url = os.getenv("BASE_URL", os.getenv("BASE_API_URL", "https://mainnet.zklighter.elliot.ai"))
+    return lighter.ApiClient(configuration=lighter.Configuration(host=base_url))
 
 
-def _price_to_int(market: str, price_float: float) -> int:
-    dec = _price_decimals(market)
-    scale = 10 ** dec
-    p = int(round(price_float * scale))
-    if p < 1:
-        p = 1
-    return p
-
-
-async def _get_best_prices(base_url: str, market_index: int) -> Tuple[float, float]:
-    """
-    Returns (best_bid, best_ask) as floats from order book.
-    """
-    client = zklighter.ApiClient(configuration=zklighter.Configuration(host=base_url))
-    try:
-        order_api = zklighter.OrderApi(client)
-        ob = await order_api.order_book_orders(market_id=market_index, limit=10)
-        best_bid = float(ob.bids[0].price) if ob.bids else 0.0
-        best_ask = float(ob.asks[0].price) if ob.asks else 0.0
-        if best_bid <= 0 or best_ask <= 0:
-            raise HTTPException(status_code=500, detail="Could not read best bid/ask from order book")
-        return best_bid, best_ask
-    finally:
-        try:
-            await client.close()
-        except Exception:
-            pass
-
-
-def _extract_tx_payload(tx_obj: Any) -> Tuple[Optional[int], Optional[Any]]:
-    """
-    We want something we can POST to /api/v1/sendTx:
-      {"tx_type": <int>, "tx_info": <object>}
-    Different SDK builds represent tx differently, so we try a few shapes.
-    """
-    # 1) direct attrs
-    tx_type = getattr(tx_obj, "tx_type", None)
-    tx_info = getattr(tx_obj, "tx_info", None)
-    if tx_type is not None and tx_info is not None:
-        return int(tx_type), tx_info
-
-    # 2) dict-like
-    if isinstance(tx_obj, dict):
-        if "tx_type" in tx_obj and "tx_info" in tx_obj:
-            return int(tx_obj["tx_type"]), tx_obj["tx_info"]
-
-    # 3) to_json()
-    to_json = getattr(tx_obj, "to_json", None)
-    if callable(to_json):
-        j = to_json()
-        if isinstance(j, dict) and "tx_type" in j and "tx_info" in j:
-            return int(j["tx_type"]), j["tx_info"]
-
-    # 4) model_dump()
-    model_dump = getattr(tx_obj, "model_dump", None)
-    if callable(model_dump):
-        j = model_dump()
-        if isinstance(j, dict) and "tx_type" in j and "tx_info" in j:
-            return int(j["tx_type"]), j["tx_info"]
-
-    return None, None
-
-
-async def _broadcast_sendtx_rest(base_url: str, tx_type: int, tx_info: Any) -> Any:
-    """
-    REST broadcast:
-      POST {BASE_URL}/api/v1/sendTx
-      body: {"tx_type": <int>, "tx_info": <...>}
-    """
-    url = base_url.rstrip("/") + "/api/v1/sendTx"
-    async with httpx.AsyncClient(timeout=30) as http:
-        r = await http.post(url, json={"tx_type": tx_type, "tx_info": tx_info})
-        # Lighter often returns JSON either way; keep raw if not JSON.
-        try:
-            data = r.json()
-        except Exception:
-            data = {"status_code": r.status_code, "text": r.text}
-        return data
-
-
-# ----------------------------
-# Request model
-# ----------------------------
+# -----------------------------
+# Models
+# -----------------------------
 class OrderReq(BaseModel):
     market: str = Field(..., description='e.g. "BTC-USDC"')
     side: Literal["BUY", "SELL"]
-    size: float = Field(..., gt=0, description="Base size (e.g. BTC amount)")
+    size: float = Field(..., gt=0, description="Base asset size, e.g. 0.0001 BTC")
+    price: float = Field(..., gt=0, description="Required by Lighter for market-like orders")
     live: bool = False
 
-    # Optional slippage guard (for market-like execution)
-    slippage_bps: int = Field(default=50, ge=0, le=2000, description="0.01% = 1 bps. Default 50 bps (0.50%).")
+
+# -----------------------------
+# Tx extraction + broadcasting
+# -----------------------------
+def _normalise_signed_output(raw: Any) -> Dict[str, Any]:
+    """
+    Try to extract tx_type + tx_info from whatever the SDK returns.
+    We keep the raw response for debugging too.
+    """
+    tx_type = None
+    tx_info = None
+
+    # dict shapes
+    if isinstance(raw, dict):
+        if "tx_type" in raw and "tx_info" in raw:
+            tx_type = raw.get("tx_type")
+            tx_info = raw.get("tx_info")
+        elif "signed" in raw and isinstance(raw["signed"], dict):
+            s = raw["signed"]
+            if "tx_type" in s and "tx_info" in s:
+                tx_type = s.get("tx_type")
+                tx_info = s.get("tx_info")
+
+    # tuple/list shapes
+    if (tx_type is None or tx_info is None) and isinstance(raw, (list, tuple)):
+        # common: (signed, err)
+        if len(raw) == 2 and raw[1] is None:
+            return _normalise_signed_output(raw[0])
+
+        # sometimes: (tx_type, tx_info, ...)
+        if len(raw) >= 2:
+            a, b = raw[0], raw[1]
+            # tx_type might be int/str, tx_info often dict/str
+            if isinstance(a, (int, str)) and isinstance(b, (dict, str)):
+                tx_type, tx_info = a, b
+
+        # or tx packaged inside any element dict
+        if tx_type is None or tx_info is None:
+            for item in raw:
+                if isinstance(item, dict) and "tx_type" in item and "tx_info" in item:
+                    tx_type = item.get("tx_type")
+                    tx_info = item.get("tx_info")
+                    break
+
+    return {
+        "tx_type": tx_type,
+        "tx_info": tx_info,
+        "raw": raw,
+    }
 
 
-# ----------------------------
+async def _call_next_nonce(tx_api: Any, account_index: int, api_key_index: int) -> int:
+    for name in ["next_nonce", "nextNonce"]:
+        fn = getattr(tx_api, name, None)
+        if fn:
+            res = await _maybe_await(fn(account_index=account_index, api_key_index=api_key_index))
+            if hasattr(res, "nonce"):
+                return int(res.nonce)
+            if isinstance(res, dict) and "nonce" in res:
+                return int(res["nonce"])
+    raise HTTPException(status_code=500, detail="Could not find TransactionApi next_nonce method")
+
+
+async def _broadcast(tx_api: Any, tx_type: Any, tx_info: Any) -> Any:
+    """
+    Newer lighter builds want: send_tx(tx_type=?, tx_info=?)
+    Older builds sometimes want: send_tx(tx=?)
+    We try a few.
+    """
+    send_fn = getattr(tx_api, "send_tx", None) or getattr(tx_api, "sendTx", None)
+    if not send_fn:
+        raise HTTPException(status_code=500, detail="TransactionApi has no send_tx method")
+
+    last_err = None
+
+    # Attempt 1: keyword tx_type/tx_info
+    try:
+        return await _maybe_await(send_fn(tx_type=tx_type, tx_info=tx_info))
+    except Exception as e:
+        last_err = e
+
+    # Attempt 2: positional (tx_type, tx_info)
+    try:
+        return await _maybe_await(send_fn(tx_type, tx_info))
+    except Exception as e:
+        last_err = e
+
+    # Attempt 3: single kw "tx" packed
+    try:
+        return await _maybe_await(send_fn(tx={"tx_type": tx_type, "tx_info": tx_info}))
+    except Exception as e:
+        last_err = e
+
+    # Attempt 4: single positional packed
+    try:
+        return await _maybe_await(send_fn({"tx_type": tx_type, "tx_info": tx_info}))
+    except Exception as e:
+        last_err = e
+
+    raise HTTPException(status_code=500, detail=f"Could not broadcast tx. last_error={last_err}")
+
+
+def _to_base_amount(market: str, size: float) -> int:
+    """
+    Convert size float to base_amount int using AMOUNT_SCALE_MAP if present,
+    otherwise BASE_DECIMALS_MAP (scale = 10**decimals).
+    """
+    scale_map = _parse_map("AMOUNT_SCALE_MAP")  # e.g. BTC-USDC=100000000
+    if market in scale_map:
+        scale = int(scale_map[market])
+        return int(round(size * scale))
+
+    dec_map = _parse_map("BASE_DECIMALS_MAP")  # e.g. BTC-USDC=8
+    if market in dec_map:
+        decimals = int(dec_map[market])
+        return int(round(size * (10 ** decimals)))
+
+    # fallback (safe-ish)
+    return int(round(size * (10 ** 8)))
+
+
+def _to_price_int(price: float) -> int:
+    """
+    Your logs show Lighter expecting an int and erroring on float.
+    For now we treat price as an integer number of quote units (e.g. 45000).
+    """
+    return int(price)
+
+
+def _market_index_for(market: str) -> int:
+    mi = _parse_map("MARKET_INDEX_MAP")  # BTC-USDC=1
+    if market not in mi:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not resolve market_index for {market}. Set MARKET_INDEX_MAP env var like: BTC-USDC=1,ETH-USDC=2",
+        )
+    return int(mi[market])
+
+
+def _sign_create_order_positional(
+    signer: Any,
+    market_index: int,
+    client_order_index: int,
+    base_amount: int,
+    price_int: int,
+    is_ask: bool,
+    nonce: int,
+    api_key_index: int,
+) -> Any:
+    """
+    Calls the signature your logs show (positional):
+      sign_create_order(market_index, client_order_index, base_amount, price, is_ask,
+                        order_type, time_in_force, reduce_only=False, trigger_price=0,
+                        order_expiry=-1, nonce=-1, api_key_index=255)
+    We set:
+      order_type=1  (market-like)
+      time_in_force=0
+      reduce_only=False
+      trigger_price=0
+      order_expiry=-1
+    """
+    fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
+    if not fn:
+        raise HTTPException(status_code=500, detail="SignerClient does not expose sign_create_order")
+
+    order_type = 1          # market-like (based on your earlier success with order_type=1)
+    time_in_force = 0
+    reduce_only = False
+    trigger_price = 0
+    order_expiry = -1
+
+    # Use positional to avoid kw mismatch across builds
+    return fn(
+        market_index,
+        client_order_index,
+        base_amount,
+        price_int,
+        is_ask,
+        order_type,
+        time_in_force,
+        reduce_only,
+        trigger_price,
+        order_expiry,
+        nonce,
+        api_key_index,
+    )
+
+
+# -----------------------------
 # Endpoints
-# ----------------------------
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": int(time.time())}
@@ -207,106 +313,118 @@ def health():
 
 @app.get("/debug-env")
 def debug_env():
-    base_url = os.getenv("BASE_URL", "https://mainnet.zklighter.elliot.ai")
+    # Do NOT leak secrets; just show presence/lengths
+    api_key_raw = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY", "")
+    api_key_no0x = _strip_0x(api_key_raw).strip()
     return {
-        "BASE_URL": base_url,
+        "BASE_URL": os.getenv("BASE_URL", os.getenv("BASE_API_URL", "https://mainnet.zklighter.elliot.ai")),
         "LIGHTER_ACCOUNT_INDEX": os.getenv("LIGHTER_ACCOUNT_INDEX"),
         "LIGHTER_API_KEY_INDEX": os.getenv("LIGHTER_API_KEY_INDEX"),
+        "LIGHTER_API_KEY_PRIVATE_KEY_len_raw": len(api_key_raw),
+        "LIGHTER_API_KEY_PRIVATE_KEY_len_no0x": len(api_key_no0x),
         "ETH_PRIVATE_KEY_present": bool(os.getenv("ETH_PRIVATE_KEY")),
         "BOT_TOKEN_set": bool(os.getenv("BOT_TOKEN")),
-        "MARKET_INDEX_MAP_preview": os.getenv("MARKET_INDEX_MAP", ""),
-        "BASE_DECIMALS_MAP_preview": os.getenv("BASE_DECIMALS_MAP", ""),
-        "PRICE_DECIMALS_MAP_preview": os.getenv("PRICE_DECIMALS_MAP", ""),
+        "MARKET_INDEX_MAP_preview": os.getenv("MARKET_INDEX_MAP", "")[:80],
+        "BASE_DECIMALS_MAP_preview": os.getenv("BASE_DECIMALS_MAP", "")[:80],
+        "AMOUNT_SCALE_MAP_preview": os.getenv("AMOUNT_SCALE_MAP", "")[:80],
     }
 
 
 @app.post("/order")
-async def place_order(req: OrderReq, x_bot_token: Optional[str] = Header(default=None)):
+async def place_order(
+    req: OrderReq,
+    x_bot_token: Optional[str] = Header(default=None, convert_underscores=False),
+):
     _auth(x_bot_token)
 
-    base_url = os.getenv("BASE_URL", "https://mainnet.zklighter.elliot.ai")
-    eth_private_key = _need("ETH_PRIVATE_KEY")
+    signer = None
+    api_client = None
 
-    market_index = _market_index(req.market)
-    base_amount = _size_to_base_amount(req.market, req.size)
-
-    # MARKET order needs a price guard in many matching engines (slippage bound).
-    best_bid, best_ask = await _get_best_prices(base_url, market_index)
-
-    if req.side == "BUY":
-        ref_price = best_ask
-        # allow paying up to +slippage
-        bounded = ref_price * (1.0 + (req.slippage_bps / 10_000.0))
-    else:
-        ref_price = best_bid
-        # allow selling down to -slippage
-        bounded = ref_price * (1.0 - (req.slippage_bps / 10_000.0))
-
-    price_int = _price_to_int(req.market, bounded)
-
-    # order_expiry: give it ~5 minutes
-    order_expiry = int((time.time() + 5 * 60) * 1000)
-    client_order_index = int(time.time() * 1000)
-
-    client = None
     try:
-        # NOTE: Official docs show SignerClient(BASE_URL, PRIVATE_KEY)
-        # (and create_order rather than sign_create_order).
-        client = zklighter.SignerClient(base_url, eth_private_key)
+        # env requirements
+        _need("ETH_PRIVATE_KEY")  # signer uses this internally depending on build
+        account_index = _as_int("LIGHTER_ACCOUNT_INDEX")
+        api_key_index = _as_int("LIGHTER_API_KEY_INDEX")
 
-        tx = await client.create_order(
+        market_index = _market_index_for(req.market)
+        base_amount = _to_base_amount(req.market, req.size)
+        price_int = _to_price_int(req.price)
+
+        # BUY => is_ask False, SELL => is_ask True
+        is_ask = True if req.side == "SELL" else False
+
+        signer = make_signer_client()
+        err = signer.check_client()
+        if err is not None:
+            raise HTTPException(status_code=500, detail=f"check_client failed: {err}")
+
+        api_client = make_api_client()
+        tx_api = lighter.TransactionApi(api_client)
+
+        nonce = await _call_next_nonce(tx_api, account_index, api_key_index)
+        client_order_index = int(time.time() * 1000)
+
+        raw_signed = _sign_create_order_positional(
+            signer=signer,
             market_index=market_index,
             client_order_index=client_order_index,
             base_amount=base_amount,
-            price=price_int,
-            is_ask=0 if req.side == "BUY" else 1,
-            order_type=zklighter.SignerClient.ORDER_TYPE_MARKET,
-            time_in_force=zklighter.SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-            order_expiry=order_expiry,
+            price_int=price_int,
+            is_ask=is_ask,
+            nonce=nonce,
+            api_key_index=api_key_index,
         )
 
-        # Some SDK builds return (tx, response). Handle both.
-        response_obj = None
-        tx_obj = tx
-        if isinstance(tx, (list, tuple)) and len(tx) == 2:
-            tx_obj, response_obj = tx[0], tx[1]
+        signed_norm = _normalise_signed_output(raw_signed)
+        tx_type = signed_norm.get("tx_type")
+        tx_info = signed_norm.get("tx_info")
 
-        tx_type, tx_info = _extract_tx_payload(tx_obj)
-
-        result = {
-            "success": True,
-            "live": req.live,
-            "market": req.market,
-            "market_index": market_index,
-            "side": req.side,
-            "size": req.size,
-            "base_amount": base_amount,
-            "slippage_bps": req.slippage_bps,
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "price_bound_used": bounded,
-            "price_int": price_int,
-            "order_expiry": order_expiry,
-            "client_order_index": client_order_index,
-            "sdk_response": getattr(response_obj, "model_dump", lambda: response_obj)() if response_obj is not None else None,
-            "tx_type": tx_type,
-            "tx_info_present": tx_info is not None,
-        }
-
+        # If not live: just return what we'd broadcast
         if not req.live:
-            # Return signed payload details (useful for debugging), but don't broadcast.
-            return result
+            return {
+                "success": True,
+                "live": False,
+                "message": "Signed market-like order OK (not sent). Set live=true to broadcast.",
+                "market": req.market,
+                "market_index": market_index,
+                "side": req.side,
+                "is_ask": is_ask,
+                "size": req.size,
+                "base_amount": base_amount,
+                "price": req.price,
+                "order_price_int": price_int,
+                "nonce": nonce,
+                "client_order_index": client_order_index,
+                "tx_type": tx_type,
+                "tx_info_present": tx_info is not None,
+                "signed_raw": raw_signed,
+            }
 
-        # LIVE: broadcast via REST
+        # Live: require broadcast-ready payload
         if tx_type is None or tx_info is None:
             raise HTTPException(
                 status_code=500,
-                detail="Signed output did not include tx_type/tx_info (cannot broadcast). Check zklighter SDK version.",
+                detail="Signed output did not include tx_type/tx_info, cannot broadcast with this lighter-sdk build.",
             )
 
-        sent = await _broadcast_sendtx_rest(base_url, tx_type, tx_info)
-        result["broadcast"] = sent
-        return result
+        sent = await _broadcast(tx_api, tx_type, tx_info)
+
+        return {
+            "success": True,
+            "live": True,
+            "market": req.market,
+            "market_index": market_index,
+            "side": req.side,
+            "is_ask": is_ask,
+            "size": req.size,
+            "base_amount": base_amount,
+            "price": req.price,
+            "order_price_int": price_int,
+            "nonce": nonce,
+            "client_order_index": client_order_index,
+            "tx_type": tx_type,
+            "response": sent,
+        }
 
     except HTTPException:
         raise
@@ -314,7 +432,12 @@ async def place_order(req: OrderReq, x_bot_token: Optional[str] = Header(default
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
-            if client is not None:
-                await client.close()
+            if signer is not None:
+                await signer.close()
+        except Exception:
+            pass
+        try:
+            if api_client is not None:
+                await api_client.close()
         except Exception:
             pass

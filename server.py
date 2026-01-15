@@ -41,9 +41,17 @@ def _strip_0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
 
 
+def _strip_quotes(s: str) -> str:
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        return s[1:-1].strip()
+    return s
+
+
 def _parse_kv_map(env_name: str) -> Dict[str, str]:
     """
-    Parses "A=1,B=2" into {"A":"1","B":"2"}
+    Parses env like: BTC-USDC=1,ETH-USDC=2
+    Also tolerates accidental quotes: "BTC-USDC"="1"
     """
     raw = os.getenv(env_name, "").strip()
     if not raw:
@@ -54,7 +62,9 @@ def _parse_kv_map(env_name: str) -> Dict[str, str]:
         if "=" not in p:
             continue
         k, v = p.split("=", 1)
-        out[k.strip()] = v.strip()
+        k = _strip_quotes(k)
+        v = _strip_quotes(v)
+        out[k] = v
     return out
 
 
@@ -118,8 +128,7 @@ class OrderReq(BaseModel):
     side: Literal["BUY", "SELL"]
     size: float = Field(..., gt=0)
 
-    # Even if you want "market" orders, Lighter still wants a price field.
-    # In practice this is usually sent as an aggressive IOC limit.
+    # This SDK build still requires a price field (even for "market-like" IOC behaviour)
     price: Optional[float] = None
 
     live: bool = False  # live=false => sign only; live=true => broadcast
@@ -133,7 +142,7 @@ def _market_index(market: str) -> int:
     if market not in m:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown market {market}. Set MARKET_INDEX_MAP env var like: BTC-USDC=1,ETH-USDC=2",
+            detail=f"Unknown market {market}. Set MARKET_INDEX_MAP like: BTC-USDC=1,ETH-USDC=2",
         )
     return int(m[market])
 
@@ -141,7 +150,6 @@ def _market_index(market: str) -> int:
 def _base_decimals(market: str) -> int:
     m = _parse_kv_map("BASE_DECIMALS_MAP")
     if market not in m:
-        # fallback default (BTC often 8)
         raise HTTPException(
             status_code=400,
             detail=f"Missing BASE_DECIMALS_MAP for {market}. Example: BTC-USDC=8,ETH-USDC=18",
@@ -170,14 +178,9 @@ async def _call_next_nonce(tx_api: Any, account_index: int, api_key_index: int) 
 
 
 def _extract_tx_type_info(signed: Any) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Different SDK builds return different shapes.
-    We want tx_type (int) and tx_info (str) if present.
-    """
     tx_type = None
     tx_info = None
 
-    # dict-like
     if isinstance(signed, dict):
         tx_type = signed.get("tx_type") or signed.get("txType")
         tx_info = signed.get("tx_info") or signed.get("txInfo")
@@ -190,7 +193,6 @@ def _extract_tx_type_info(signed: Any) -> Tuple[Optional[int], Optional[str]]:
             tx_info = str(tx_info)
         return tx_type, tx_info
 
-    # object-like
     for a in ["tx_type", "txType"]:
         if hasattr(signed, a):
             try:
@@ -204,13 +206,7 @@ def _extract_tx_type_info(signed: Any) -> Tuple[Optional[int], Optional[str]]:
             except Exception:
                 pass
 
-    # tuple/list (common pattern: (tx_type, tx_info, ...))
     if isinstance(signed, (list, tuple)) and len(signed) >= 2:
-        # Sometimes it's (signed_obj, err) — handle that
-        if len(signed) == 2 and signed[1] is not None and not isinstance(signed[0], (int, str, dict)):
-            # (something, err)
-            raise HTTPException(status_code=500, detail=f"Signing returned error: {signed[1]}")
-        # otherwise treat first two as (tx_type, tx_info)
         try:
             tx_type = int(signed[0])
         except Exception:
@@ -234,23 +230,19 @@ async def _sign_create_order_exact(
     nonce: int,
 ) -> Any:
     """
-    Calls sign_create_order() using the signature shape your errors showed:
-    (market_index, client_order_index, api_key_index, base_amount, price, is_ask, order_type, time_in_force, reduce_only, trigger_price=0, order_expiry=-1, nonce=-1, ...)
-
-    We do NOT pass eth_private_key here because your SDK build clearly doesn't accept it.
+    Uses the signature shape your lighter-sdk build is showing in errors.
+    IMPORTANT FIX: trigger_price must be int (0), not float (0.0).
     """
     fn = getattr(signer, "sign_create_order", None) or getattr(signer, "signCreateOrder", None)
     if not fn:
         raise HTTPException(status_code=500, detail="SignerClient does not expose sign_create_order")
 
-    # Choose IOC “market-like” order behaviour:
-    # - order_type: 0 (LIMIT) with IOC time_in_force often behaves as market.
-    # - time_in_force: 1 (IOC) is common. If your SDK uses different mapping, you can tweak.
-    order_type = 0
-    time_in_force = 1
+    # "Market-like" behaviour via IOC limit (common pattern)
+    order_type = 0        # LIMIT
+    time_in_force = 1     # IOC (typical)
     reduce_only = False
-    trigger_price = 0
-    order_expiry = -1  # no expiry
+    trigger_price = 0     # MUST be int for your build
+    order_expiry = -1     # no expiry
 
     args = [
         int(market_index),
@@ -262,7 +254,7 @@ async def _sign_create_order_exact(
         int(order_type),
         int(time_in_force),
         bool(reduce_only),
-        float(trigger_price),
+        int(trigger_price),     # <--- FIXED
         int(order_expiry),
         int(nonce),
     ]
@@ -270,7 +262,6 @@ async def _sign_create_order_exact(
     try:
         out = fn(*args)
         out = await _maybe_await(out)
-        # Some SDKs return (signed, err)
         if isinstance(out, (list, tuple)) and len(out) == 2:
             signed, err = out
             if err is not None:
@@ -289,7 +280,6 @@ async def _broadcast_tx(tx_api: Any, tx_type: int, tx_info: str) -> Any:
     """
     Broadcast with multiple possible send signatures across lighter-sdk builds.
     """
-    # TransactionApi might be named differently in some versions
     candidates = []
     for name in ["send_tx", "sendTx", "broadcast_tx", "broadcastTx"]:
         fn = getattr(tx_api, name, None)
@@ -301,25 +291,25 @@ async def _broadcast_tx(tx_api: Any, tx_type: int, tx_info: str) -> Any:
 
     last_err = None
     for name, fn in candidates:
-        # 1) keyword style
+        # keyword style
         try:
             return await _maybe_await(fn(tx_type=tx_type, tx_info=tx_info))
         except Exception as e:
             last_err = e
 
-        # 2) positional style
+        # positional style
         try:
             return await _maybe_await(fn(tx_type, tx_info))
         except Exception as e:
             last_err = e
 
-        # 3) some builds expect a single request object or dict
+        # dict style
         try:
             return await _maybe_await(fn({"tx_type": tx_type, "tx_info": tx_info}))
         except Exception as e:
             last_err = e
 
-        # 4) some builds accept tx=ReqSendTx(...)
+        # tx=... style
         try:
             ReqSendTx = getattr(lighter, "ReqSendTx", None)
             if ReqSendTx:
@@ -328,7 +318,6 @@ async def _broadcast_tx(tx_api: Any, tx_type: int, tx_info: str) -> Any:
         except Exception as e:
             last_err = e
 
-        # 5) some builds accept tx=... kwargs but different key name
         try:
             return await _maybe_await(fn(tx={"tx_type": tx_type, "tx_info": tx_info}))
         except Exception as e:
@@ -391,9 +380,8 @@ async def place_order(
         market_index = _market_index(req.market)
         base_amount_int = _to_base_amount_int(req.market, req.size)
 
-        # price required for this SDK build – even for “market-like” IOC behaviour
         if req.price is None:
-            raise HTTPException(status_code=400, detail="price is required for this build (use an aggressive IOC price)")
+            raise HTTPException(status_code=400, detail="price is required for this build")
 
         is_ask = True if req.side == "SELL" else False
         client_order_index = int(time.time() * 1000)
@@ -421,7 +409,6 @@ async def place_order(
 
         tx_type, tx_info = _extract_tx_type_info(signed)
 
-        # Sign-only response
         if not req.live:
             return {
                 "success": True,
@@ -439,12 +426,10 @@ async def place_order(
                 "tx_info_present": bool(tx_info),
             }
 
-        # Live broadcast requires tx_type + tx_info
         if tx_type is None or not tx_info:
             raise HTTPException(
                 status_code=500,
-                detail="Signed output did not include tx_type/tx_info, cannot broadcast. "
-                       "This indicates a signer SDK mismatch with the broadcast client.",
+                detail="Signed output did not include tx_type/tx_info, cannot broadcast.",
             )
 
         sent = await _broadcast_tx(tx_api, tx_type=tx_type, tx_info=tx_info)
